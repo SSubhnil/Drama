@@ -245,7 +245,14 @@ class MixerModel(nn.Module):
         }
 
     def forward(self, samples, action, inference_params=None, **mixer_kwargs):
-        action = F.one_hot(action.long(), self.action_dim).float()
+        # Check if action has 4 dimensions and reshape if needed
+        print(f"Action before processing: {action}")
+        # action = F.one_hot(action.long(), self.action_dim).float()
+        if action.dim() == 3:
+            print(f"Reshaping action from {action.shape} to ", end="")
+            # Assuming the extra dimension is the last one and we want to keep the first 3
+            action = action[:, :, :, 0]  # Take only the first slice of the last dimension
+            print(f"{action.shape}")
         hidden_states = self.stem(torch.cat([samples, action], dim=-1))
             
         residual = None

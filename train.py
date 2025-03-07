@@ -102,16 +102,43 @@ def joint_train_world_model_agent(config, logdir,
         env = Atari(config.BasicSettings.Env_name, size=(config.BasicSettings.ImageSize,config.BasicSettings.ImageSize), seed=config.BasicSettings.Seed)
     elif config.BasicSettings.Env_name.startswith('memory'):
         env = MemoryMaze(config.BasicSettings.Env_name, size=(config.BasicSettings.ImageSize,config.BasicSettings.ImageSize), seed=config.BasicSettings.Seed)
+    elif config.BasicSettings.Env_name.startswith('dm_control'):
+        # Format: dm_control/domain/task (e.g., dm_control/cartpole/swingup)
+        parts = config.BasicSettings.Env_name.split('/')
+        if len(parts) >= 3:
+            domain_name = parts[1]
+            task_name = parts[2]
+            from envs.dm_control_wrapper import build_dm_control_env
+            env = build_dm_control_env(
+                domain_name=domain_name, 
+                task_name=task_name, 
+                size=(config.BasicSettings.ImageSize, config.BasicSettings.ImageSize),
+                channels_first=False,  # We'll need channels last for rendering
+                frame_skip=4,
+                seed=config.BasicSettings.Seed
+            )
+            # Set ContinuousActions flag
+            config.update_or_create('BasicSettings.ContinuousActions', True)
+        else:
+            raise ValueError(f"Invalid DM Control environment format: {config.BasicSettings.Env_name}. Use 'dm_control/domain/task'")
     else:
         assert ValueError(f'Unknown environment name: {config.BasicSettings.Env_name}')
     print("Current env: " + colorama.Fore.YELLOW + f"{config.BasicSettings.Env_name}" + colorama.Style.RESET_ALL)
 
-    atari_benchmark_df = pd.read_csv("atari_performance.csv", index_col='Task', usecols=lambda column: column in ['Task', 'Alien', 'Amidar', 'Assault', 'Asterix', 'BankHeist', 'BattleZone', 'Boxing', 'Breakout', 'ChopperCommand', 'CrazyClimber', 'DemonAttack', 'Freeway', 'Frostbite', 'Gopher', 'Hero', 'Jamesbond', 'Kangaroo', 'Krull', 'KungFuMaster', 'MsPacman', 'Pong', 'PrivateEye', 'Qbert', 'RoadRunner', 'Seaquest', 'UpNDown'])
-    atari_pure_name = config.BasicSettings.Env_name.split('/')[-1].split('-')[0]
-    game_benchmark_df = atari_benchmark_df.get(atari_pure_name)
+    # Get benchmark data for Atari environments (not applicable for DM Control)
+    if not config.BasicSettings.Env_name.startswith('dm_control'):
+        atari_benchmark_df = pd.read_csv("atari_performance.csv", index_col='Task', usecols=lambda column: column in ['Task', 'Alien', 'Amidar', 'Assault', 'Asterix', 'BankHeist', 'BattleZone', 'Boxing', 'Breakout', 'ChopperCommand', 'CrazyClimber', 'DemonAttack', 'Freeway', 'Frostbite', 'Gopher', 'Hero', 'Jamesbond', 'Kangaroo', 'Krull', 'KungFuMaster', 'MsPacman', 'Pong', 'PrivateEye', 'Qbert', 'RoadRunner', 'Seaquest', 'UpNDown'])
+        atari_pure_name = config.BasicSettings.Env_name.split('/')[-1].split('-')[0]
+        game_benchmark_df = atari_benchmark_df.get(atari_pure_name)
     
     sum_reward = 0
-    current_ob, info = env.reset()
+    
+    # Initial environment reset
+    if config.BasicSettings.Env_name.startswith('dm_control') or hasattr(env, '_gym_disable_underscore_compat'):
+        current_ob, info = env.reset()
+    else:
+        current_ob, info = env.reset()
+        
     context_obs = deque(maxlen=config.JointTrainAgent.RealityContextLength)
     context_action = deque(maxlen=config.JointTrainAgent.RealityContextLength)
 
@@ -141,8 +168,16 @@ def joint_train_world_model_agent(config, logdir,
             context_action.append(action)
         else:
             action = env.action_space.sample()
-
-        ob, reward, is_last, info = env.step(action)
+         # F.one_hot
+        # Check if we're using a DM Control environment or a newer Gymnasium environment (5 return values)
+        if config.BasicSettings.Env_name.startswith('dm_control') or hasattr(env, '_gym_disable_underscore_compat'):
+            ob, reward, terminated, truncated, info = env.step(action)
+            # Combine terminated and truncated into a single "is_last" flag
+            is_last = terminated or truncated
+        else:
+            # Legacy environments with 4 return values
+            ob, reward, is_last, info = env.step(action)
+            
         replay_buffer.append(current_ob, action, reward, info['is_terminal'])
 
         sum_reward += reward
@@ -151,7 +186,7 @@ def joint_train_world_model_agent(config, logdir,
         if is_last:
             logger.log(f"episode/score", sum_reward, global_step=total_steps)
             logger.log(f"episode/length", info["episode_frame_number"], global_step=total_steps)  # framskip=4
-            if config.BasicSettings.Env_name.startswith('ALE'):
+            if config.BasicSettings.Env_name.startswith('ALE') and not config.BasicSettings.Env_name.startswith('dm_control'):
                 logger.log(f"episode/normalised score", (sum_reward - game_benchmark_df['Random'])/(game_benchmark_df['Human'] - game_benchmark_df['Random']), global_step=total_steps)
                 for algorithm in game_benchmark_df.index[2:]:
                     denominator = game_benchmark_df[algorithm] - game_benchmark_df['Random']
@@ -160,7 +195,13 @@ def joint_train_world_model_agent(config, logdir,
                         logger.log(f"benchmark/normalised {algorithm} score", normalized_score, global_step=total_steps)
             
             sum_reward = 0
-            ob, info = env.reset()
+            # Reset the environment
+            if config.BasicSettings.Env_name.startswith('dm_control') or hasattr(env, '_gym_disable_underscore_compat'):
+                ob, info = env.reset()
+            else:
+                # Legacy environments
+                ob, info = env.reset()
+                
             context_obs.clear()
             context_action.clear()
 
@@ -235,7 +276,7 @@ def build_agent(conf, action_dim, device):
             conf=conf,
             action_dim=action_dim,
             device = device
-        ).cuda(device)        
+        ).cuda(device)
 
 
 class DotDict(dict):
@@ -314,26 +355,31 @@ def parse_args_and_update_config(config, prefix=''):
     return config
 
 def update_model_parameters(config, world_model, agent):
-    config.update_or_create('Models.WorldModel.TotalParamNum', sum([p.numel() for p in world_model.parameters()]))
-    print(f'World model total parameters: {sum([p.numel() for p in world_model.parameters()]):,}')
+    # World model parameter counts
+    world_model_param_count = sum([p.numel() for p in world_model.parameters()])
+    backbone_param_count = sum([p.numel() for p in world_model.sequence_model.parameters()])
+    encoder_param_count = sum([p.numel() for p in world_model.encoder.parameters()])
+    decoder_param_count = sum([p.numel() for p in world_model.image_decoder.parameters()])
+    disc_layer_param_count = sum([p.numel() for p in world_model.dist_head.parameters()])
     
-    config.update_or_create('Models.WorldModel.BackboneParamNum', sum([p.numel() for p in world_model.sequence_model.parameters()]))
-    print(f'Dynamic model parameters: {sum([p.numel() for p in world_model.sequence_model.parameters()]):,}')
+    print(f'World model total parameters: {world_model_param_count:,}')
+    print(f'Dynamic model parameters: {backbone_param_count:,}')
+    print(f'Encoder parameters: {encoder_param_count:,}')
+    print(f'Decoder parameters: {decoder_param_count:,}')
+    print(f'Discretisation layer parameters: {disc_layer_param_count:,}')
     
-    config.update_or_create('Models.WorldModel.EncoderParamNum', sum([p.numel() for p in world_model.encoder.parameters()]))
-    print(f'Encoder parameters: {sum([p.numel() for p in world_model.encoder.parameters()]):,}')
+    # Agent parameter counts
+    if hasattr(agent, 'continuous') and agent.continuous:
+        actor_param_count = sum([p.numel() for p in agent.actor_mean.parameters()])
+        if hasattr(agent, 'action_log_std'):
+            actor_param_count += agent.action_log_std.numel()
+        print(f'Actor parameters: {actor_param_count:,}')
+    else:
+        actor_param_count = sum([p.numel() for p in agent.actor.parameters()])
+        print(f'Actor parameters: {actor_param_count:,}')
     
-    config.update_or_create('Models.WorldModel.DecoderParamNum', sum([p.numel() for p in world_model.image_decoder.parameters()]))
-    print(f'Decoder parameters: {sum([p.numel() for p in world_model.image_decoder.parameters()]):,}')
-    
-    config.update_or_create('Models.WorldModel.DiscretisationLayerParamNum', sum([p.numel() for p in world_model.dist_head.parameters()]))
-    print(f'Discretisation layer parameters: {sum([p.numel() for p in world_model.dist_head.parameters()]):,}')
-    
-    config.update_or_create('Models.Agent.ActorParamNum', sum([p.numel() for p in agent.actor.parameters()]))
-    print(f'Actor parameters: {sum([p.numel() for p in agent.actor.parameters()]):,}')
-    
-    config.update_or_create('Models.Agent.CriticParamNum', sum([p.numel() for p in agent.critic.parameters()]))
-    print(f'Critic parameters: {sum([p.numel() for p in agent.critic.parameters()]):,}')
+    critic_param_count = sum([p.numel() for p in agent.critic.parameters()])
+    print(f'Critic parameters: {critic_param_count:,}')
 
 if __name__ == "__main__":
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -355,12 +401,26 @@ if __name__ == "__main__":
     # getting action_dim with dummy env
     if config.BasicSettings.Env_name.startswith('ALE'):
         dummy_env = Atari(config.BasicSettings.Env_name)
+        action_dim = dummy_env.action_space.n
+        config.update_or_create('BasicSettings.ContinuousActions', False)
     elif config.BasicSettings.Env_name.startswith('memory'):
         dummy_env = MemoryMaze(config.BasicSettings.Env_name)
+        action_dim = dummy_env.action_space.n
+        config.update_or_create('BasicSettings.ContinuousActions', False)
+    elif config.BasicSettings.Env_name.startswith('dm_control'):
+        # Format: dm_control/domain/task (e.g., dm_control/cartpole/swingup)
+        parts = config.BasicSettings.Env_name.split('/')
+        if len(parts) >= 3:
+            domain_name = parts[1]
+            task_name = parts[2]
+            from envs.dm_control_wrapper import build_dm_control_env
+            dummy_env = build_dm_control_env(domain_name=domain_name, task_name=task_name)
+            action_dim = dummy_env.action_space.shape[0]  # For continuous actions, this is the dimensionality
+            config.update_or_create('BasicSettings.ContinuousActions', True)
+        else:
+            raise ValueError(f"Invalid DM Control environment format: {config.BasicSettings.Env_name}. Use 'dm_control/domain/task'")
     else:
         assert ValueError(f'Unknown environment name: {config.BasicSettings.Env_name}')
-
-    action_dim = dummy_env.action_space.n
 
     # build world model and agent
     world_model = build_world_model(config, action_dim, device=device)

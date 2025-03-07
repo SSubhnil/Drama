@@ -13,17 +13,53 @@ class ReplayBuffer():
         max_length = config.JointTrainAgent.BufferMaxLength
         obs_shape = (config.BasicSettings.ImageSize, config.BasicSettings.ImageSize, config.BasicSettings.ImageChannel)
         self.device = device
+        
+        # Check if we have continuous actions
+        self.continuous_actions = getattr(config.BasicSettings, "ContinuousActions", False)
+        
+        # For continuous actions, we need to know the action dimension
+        if self.continuous_actions:
+            # DM Control environments have format dm_control/domain/task
+            if config.BasicSettings.Env_name.startswith('dm_control'):
+                parts = config.BasicSettings.Env_name.split('/')
+                if len(parts) >= 3:
+                    domain_name = parts[1]
+                    task_name = parts[2]
+                    from envs.dm_control_wrapper import build_dm_control_env
+                    dummy_env = build_dm_control_env(domain_name=domain_name, task_name=task_name)
+                    self.action_dim = dummy_env.action_space.shape[0]
+                    dummy_env.close()
+                else:
+                    # Default to a common action dimension if not specified
+                    self.action_dim = getattr(config.BasicSettings, "ActionDim", 6)
+            else:
+                # Default action dimension if not a dm_control environment
+                self.action_dim = getattr(config.BasicSettings, "ActionDim", 6)
+        else:
+            self.action_dim = 1  # For discrete actions, we just need a single index
 
         if self.store_on_gpu:
             self.obs_buffer = torch.empty((max_length, *obs_shape), dtype=torch.uint8, device=device, requires_grad=False)
-            self.action_buffer = torch.empty((max_length), dtype=torch.float32, device=device, requires_grad=False)
+            
+            # Create appropriate action buffer based on action space type
+            if self.continuous_actions:
+                self.action_buffer = torch.empty((max_length, self.action_dim), dtype=torch.float32, device=device, requires_grad=False)
+            else:
+                self.action_buffer = torch.empty((max_length), dtype=torch.float32, device=device, requires_grad=False)
+                
             self.reward_buffer = torch.empty((max_length), dtype=torch.float32, device=device, requires_grad=False)
             self.termination_buffer = torch.empty((max_length), dtype=torch.float32, device=device, requires_grad=False)
             self.sampled_counter = torch.zeros((max_length), dtype=torch.int32, device=device, requires_grad=False)
             self.imagined_counter = torch.zeros((max_length), dtype=torch.int32, device=device, requires_grad=False)
         else:
             self.obs_buffer = np.empty((max_length, *obs_shape), dtype=np.uint8)
-            self.action_buffer = np.empty((max_length), dtype=np.float32)
+            
+            # Create appropriate action buffer based on action space type
+            if self.continuous_actions:
+                self.action_buffer = np.empty((max_length, self.action_dim), dtype=np.float32)
+            else:
+                self.action_buffer = np.empty((max_length), dtype=np.float32)
+                
             self.reward_buffer = np.empty((max_length), dtype=np.float32)
             self.termination_buffer = np.empty((max_length), dtype=np.float32)
             self.sampled_counter = np.zeros((max_length), dtype=np.int32)
@@ -132,12 +168,24 @@ class ReplayBuffer():
         self.last_pointer = (self.last_pointer + 1) % (self.max_length)
         if self.store_on_gpu:
             self.obs_buffer[self.last_pointer] = torch.from_numpy(obs)
-            self.action_buffer[self.last_pointer] = torch.tensor(action, device=self.device)
+            
+            # Handle action based on whether it's continuous or discrete
+            if self.continuous_actions:
+                self.action_buffer[self.last_pointer] = torch.tensor(action, device=self.device, dtype=torch.float32)
+            else:
+                self.action_buffer[self.last_pointer] = torch.tensor(action, device=self.device)
+                
             self.reward_buffer[self.last_pointer] = torch.tensor(reward, device=self.device)
             self.termination_buffer[self.last_pointer] = torch.tensor(termination, device=self.device)
         else:
             self.obs_buffer[self.last_pointer] = obs
-            self.action_buffer[self.last_pointer] = action
+            
+            # Handle continuous actions for CPU storage as well
+            if self.continuous_actions:
+                self.action_buffer[self.last_pointer] = np.array(action, dtype=np.float32)
+            else:
+                self.action_buffer[self.last_pointer] = action
+                
             self.reward_buffer[self.last_pointer] = reward
             self.termination_buffer[self.last_pointer] = termination
 

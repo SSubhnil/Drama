@@ -26,20 +26,50 @@ def process_visualize(img):
 
 
 def build_single_env(env_name, image_size):
-    env = gymnasium.make(env_name, full_action_space=False, render_mode="rgb_array", frameskip=1, repeat_action_probability=0)
-    env = env_wrapper.MaxLast2FrameSkipWrapper(env, skip=4)
-    env = gymnasium.wrappers.ResizeObservation(env, shape=image_size)
-    return env
+    if env_name.startswith('dm_control'):
+        # Format: dm_control/domain/task (e.g., dm_control/cartpole/swingup)
+        parts = env_name.split('/')
+        if len(parts) >= 3:
+            domain_name = parts[1]
+            task_name = parts[2]
+            from envs.dm_control_wrapper import build_dm_control_env
+            env = build_dm_control_env(
+                domain_name=domain_name, 
+                task_name=task_name, 
+                size=(image_size, image_size),
+                channels_first=False,  # We'll need channels last for rendering
+                frame_skip=4,
+                seed=0
+            )
+            return env
+        else:
+            raise ValueError(f"Invalid DM Control environment format: {env_name}. Use 'dm_control/domain/task'")
+    else:
+        # Standard Atari or other Gymnasium environments
+        env = gymnasium.make(env_name, full_action_space=False, render_mode="rgb_array", frameskip=1, repeat_action_probability=0)
+        env = env_wrapper.MaxLast2FrameSkipWrapper(env, skip=4)
+        env = gymnasium.wrappers.ResizeObservation(env, shape=image_size)
+        return env
 
 
 def build_vec_env(env_name, image_size, num_envs):
-    # lambda pitfall refs to: https://python.plainenglish.io/python-pitfalls-with-variable-capture-dcfc113f39b7
-    def lambda_generator(env_name, image_size):
-        return lambda: build_single_env(env_name, image_size)
-    env_fns = []
-    env_fns = [lambda_generator(env_name, image_size) for i in range(num_envs)]
-    vec_env = gymnasium.vector.AsyncVectorEnv(env_fns=env_fns)
-    return vec_env
+    # For DM Control environments, we need to create the environments directly
+    if env_name.startswith('dm_control'):
+        # lambda pitfall refs to: https://python.plainenglish.io/python-pitfalls-with-variable-capture-dcfc113f39b7
+        def lambda_generator(env_name, image_size):
+            return lambda: build_single_env(env_name, image_size)
+        env_fns = [lambda_generator(env_name, image_size) for i in range(num_envs)]
+        
+        # Use SyncVectorEnv for DM Control as it's more compatible
+        vec_env = gymnasium.vector.SyncVectorEnv(env_fns=env_fns)
+        return vec_env
+    else:
+        # Standard Gymnasium environments
+        def lambda_generator(env_name, image_size):
+            return lambda: build_single_env(env_name, image_size)
+        env_fns = [lambda_generator(env_name, image_size) for i in range(num_envs)]
+        vec_env = gymnasium.vector.AsyncVectorEnv(env_fns=env_fns)
+        return vec_env
 
 
 def eval_episodes(config,
@@ -53,19 +83,29 @@ def eval_episodes(config,
     context_obs = deque(maxlen=config.JointTrainAgent.RealityContextLength)
     context_action = deque(maxlen=config.JointTrainAgent.RealityContextLength)
 
-    atari_benchmark_df = pd.read_csv("atari_performance.csv", index_col='Task', usecols=lambda column: column in ['Task', 'Alien', 'Amidar', 'Assault', 'Asterix', 'BankHeist', 'BattleZone', 'Boxing', 'Breakout', 'ChopperCommand', 'CrazyClimber', 'DemonAttack', 'Freeway', 'Frostbite', 'Gopher', 'Hero', 'Jamesbond', 'Kangaroo', 'Krull', 'KungFuMaster', 'MsPacman', 'Pong', 'PrivateEye', 'Qbert', 'RoadRunner', 'Seaquest', 'UpNDown'])
-    atari_pure_name = config.BasicSettings.Env_name.split('/')[-1].split('-')[0]
-    game_benchmark_df = atari_benchmark_df.get(atari_pure_name)
+    # Check if we're using a DM Control environment
+    using_dm_control = config.BasicSettings.Env_name.startswith('dm_control')
+    
+    # For Atari benchmarks
+    if not using_dm_control:
+        atari_benchmark_df = pd.read_csv("atari_performance.csv", index_col='Task', usecols=lambda column: column in ['Task', 'Alien', 'Amidar', 'Assault', 'Asterix', 'BankHeist', 'BattleZone', 'Boxing', 'Breakout', 'ChopperCommand', 'CrazyClimber', 'DemonAttack', 'Freeway', 'Frostbite', 'Gopher', 'Hero', 'Jamesbond', 'Kangaroo', 'Krull', 'KungFuMaster', 'MsPacman', 'Pong', 'PrivateEye', 'Qbert', 'RoadRunner', 'Seaquest', 'UpNDown'])
+        atari_pure_name = config.BasicSettings.Env_name.split('/')[-1].split('-')[0]
+        game_benchmark_df = atari_benchmark_df.get(atari_pure_name)
 
     episode_idx = 0
-    score_table = {"episode": [], "evaluate/score": [], "evaluate/normalised_score": []}
-    for algorithm in game_benchmark_df.index[2:]:
-        score_table[f"evaluate/normalised_{algorithm}_score"] = []
+    score_table = {"episode": [], "evaluate/score": []}
+    
+    # Only add normalized scores for Atari benchmarks
+    if not using_dm_control:
+        score_table["evaluate/normalised_score"] = []
+        for algorithm in game_benchmark_df.index[2:]:
+            score_table[f"evaluate/normalised_{algorithm}_score"] = []
+    
     with tqdm(total=config.Evaluate.EpisodeNum, desc="Evaluating episodes") as episode_pbar:
         while True:
             with torch.no_grad():
                 if len(context_action) == 0:
-                    action = vec_env.action_space.sample()
+                    action = vec_env.action_space.sample() # Environment generated
                     # action = np.array([action], dtype=int)
                     # inference_params = InferenceParams(max_seqlen=1, max_batch_size=1)
                 else:
@@ -80,49 +120,48 @@ def eval_episodes(config,
                         # prior_flattened_sample, last_dist_feat = world_model.calc_last_dist_feat(context_latent[:,-1:], model_context_action[:,-1:], inference_params)
                         prior_flattened_sample, last_dist_feat = world_model.calc_last_dist_feat(context_latent, model_context_action)
                         # prior_flattened_sample, last_dist_feat = world_model.calc_last_post_feat(context_latent, model_context_action, current_obs_tensor)
-                    action = agent.sample_as_env_action(
+                    action = agent.sample_as_env_action(  # Agent generated actions
                         torch.cat([prior_flattened_sample, last_dist_feat], dim=-1),
                         greedy=True
                     )
 
+
             context_obs.append(rearrange(torch.Tensor(current_obs).to(world_model.device), "B H W C -> B 1 C H W")/255)
             context_action.append(action)
 
-            obs, reward, done, truncated, info = vec_env.step(action)
-            # cv2.imshow("current_obs", process_visualize(obs[0]))
-            # cv2.waitKey(10)
-            # update current_obs, current_info and sum_reward
+            obs, reward, done, info, _ = vec_env.step(action)
             sum_reward += reward
             current_obs = obs
 
-            done_flag = np.logical_or(done, truncated)
+            done_flag = done
             if done_flag.any():
-                # inference_params = InferenceParams(max_seqlen=1, max_batch_size=1)
                 for i in range(config.Evaluate.NumEnvs):
                     if done_flag[i]:
                         episode_score = sum_reward[i]
-                        normalised_score = (episode_score - game_benchmark_df['Random']) / (game_benchmark_df['Human'] - game_benchmark_df['Random'])
                         
                         score_table["episode"].append(episode_idx)
                         score_table["evaluate/score"].append(episode_score)
-                        score_table["evaluate/normalised_score"].append(normalised_score)
+                        
+                        # Calculate normalized scores only for Atari environments
+                        if not using_dm_control:
+                            normalised_score = (episode_score - game_benchmark_df['Random']) / (game_benchmark_df['Human'] - game_benchmark_df['Random'])
+                            score_table["evaluate/normalised_score"].append(normalised_score)
 
-                        for algorithm in game_benchmark_df.index[2:]:
-                            denominator = game_benchmark_df[algorithm] - game_benchmark_df['Random']
-                            # Check if the denominator is zero
-                            if denominator != 0:
-                                normalised_score = (sum_reward[i] - game_benchmark_df['Random']) / denominator
-                                score_table[f"evaluate/normalised_{algorithm}_score"].append(normalised_score)
-                            else:
-                                score_table[f"evaluate/normalised_{algorithm}_score"].append(None)
+                            for algorithm in game_benchmark_df.index[2:]:
+                                denominator = game_benchmark_df[algorithm] - game_benchmark_df['Random']
+                                # Check if the denominator is zero
+                                if denominator != 0:
+                                    normalised_score = (sum_reward[i] - game_benchmark_df['Random']) / denominator
+                                    score_table[f"evaluate/normalised_{algorithm}_score"].append(normalised_score)
+                                else:
+                                    score_table[f"evaluate/normalised_{algorithm}_score"].append(None)
 
                         sum_reward[i] = 0
                         episode_idx += 1
                         episode_pbar.update(1)  # Update the episode progress bar
                         if episode_idx == config.Evaluate.EpisodeNum:
-                            # print("Mean reward: " + colorama.Fore.YELLOW + f"{np.mean(score_table['evaluate/score'])}" + colorama.Style.RESET_ALL)
                             for key, value in score_table.items():
-                                if key != 'episode' and not np.array(value).any() == None:
+                                if key != 'episode' and len(value) > 0 and not any(v is None for v in value):
                                     logger.log(key, np.mean(value), global_step=global_step)
                             return score_table
 
@@ -139,31 +178,40 @@ if __name__ == "__main__":
     with open('config_files/configure.yaml', 'r') as file:
         config = yaml.safe_load(file)
    
-    
     # Parse the arguments and update the configuration
     config = parse_args_and_update_config(config)   
-
     config = DotDict(config)
     
-    # parse arguments
-    # print(colorama.Fore.RED + str(config) + colorama.Style.RESET_ALL)
-
     device = torch.device(config.BasicSettings.Device)
 
     # set seed
     seed_np_torch(seed=config.BasicSettings.Seed)
 
-    # getting action_dim with dummy env
-    dummy_env = build_single_env(config.BasicSettings.Env_name, config.BasicSettings.ImageSize)
-    action_dim = dummy_env.action_space.n
+    # Get action dimension based on environment type
+    if config.BasicSettings.Env_name.startswith('dm_control'):
+        # Format: dm_control/domain/task (e.g., dm_control/cartpole/swingup)
+        parts = config.BasicSettings.Env_name.split('/')
+        if len(parts) >= 3:
+            domain_name = parts[1]
+            task_name = parts[2]
+            from envs.dm_control_wrapper import build_dm_control_env
+            dummy_env = build_dm_control_env(domain_name=domain_name, task_name=task_name)
+            action_dim = dummy_env.action_space.shape[0]  # For continuous actions
+            config.update_or_create('BasicSettings.ContinuousActions', True)
+            dummy_env.close()
+        else:
+            raise ValueError(f"Invalid DM Control environment format: {config.BasicSettings.Env_name}")
+    else:
+        # For standard Atari or other Gymnasium environments
+        dummy_env = build_single_env(config.BasicSettings.Env_name, config.BasicSettings.ImageSize)
+        action_dim = dummy_env.action_space.n  # For discrete actions
+        config.update_or_create('BasicSettings.ContinuousActions', False)
+        dummy_env.close()
 
     # build world model and agent
     world_model = build_world_model(config, action_dim, device=device)
-    config.update_or_create('Models.WorldModel.TotalParamNum', sum([p.numel() for p in world_model.parameters()]))
-    config.update_or_create('Models.WorldModel.BackboneParamNum', sum([p.numel() for p in world_model.sequence_model.parameters()]))
     agent = build_agent(config, action_dim, device=device)
-    config.update_or_create('Models.Agent.ActorParamNum', sum([p.numel() for p in agent.actor.parameters()]))
-    config.update_or_create('Models.Agent.CriticParamNum', sum([p.numel() for p in agent.critic.parameters()]))
+    
     if (config.BasicSettings.Compile and os.name != "nt"):  # compilation is not supported on windows
         world_model = torch.compile(world_model)
         agent = torch.compile(agent)

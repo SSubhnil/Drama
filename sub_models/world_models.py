@@ -256,6 +256,8 @@ class WorldModel(nn.Module):
         self.device = device # Maybe it's not needed
         self.model = config.Models.WorldModel.Backbone
         self.max_grad_norm = config.Models.WorldModel.Max_grad_norm  
+        self.continuous = getattr(config.BasicSettings, "ContinuousActions", False)
+        
         max_seq_length = max(config.JointTrainAgent.BatchLength, 
                              config.JointTrainAgent.ImagineContextLength + config.JointTrainAgent.ImagineBatchLength, 
                              config.JointTrainAgent.RealityContextLength)
@@ -277,7 +279,8 @@ class WorldModel(nn.Module):
                 num_layers=config.Models.WorldModel.Transformer.NumLayers,
                 num_heads=config.Models.WorldModel.Transformer.NumHeads,
                 max_length=max_seq_length,
-                dropout=config.Models.WorldModel.Dropout
+                dropout=config.Models.WorldModel.Dropout,
+                #vcontinuous_actions=self.continuous
             )
         elif self.model == 'Mamba':
             mamba_config = MambaConfig(
@@ -287,6 +290,7 @@ class WorldModel(nn.Module):
                 stoch_dim=self.stoch_flattened_dim,
                 action_dim=action_dim,
                 dropout_p=config.Models.WorldModel.Dropout,
+                #continuous_actions=self.continuous,
                 ssm_cfg={
                     'd_state': config.Models.WorldModel.Mamba.ssm_cfg.d_state,
                     }
@@ -300,6 +304,7 @@ class WorldModel(nn.Module):
                 stoch_dim=self.stoch_flattened_dim,
                 action_dim=action_dim,
                 dropout_p=config.Models.WorldModel.Dropout,
+                #continuous_actions=self.continuous,
                 ssm_cfg={
                     'd_state': config.Models.WorldModel.Mamba.ssm_cfg.d_state, 
                     'layer': 'Mamba2'}
@@ -376,11 +381,18 @@ class WorldModel(nn.Module):
     @profile
     def calc_last_dist_feat(self, latent, action, inference_params=None):
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+            # If using continuous actions, ensure we don't one-hot encode
+            if self.continuous:
+                # Make sure action has correct shape [batch, seq_len, action_dim]
+                if action.dim() == 4:  # If it somehow became [batch, seq_len, action_dim, action_dim]
+                    action = action[:, :, :, 0]  # Take just the first slice
+        
             if self.model == 'Transformer':
                 temporal_mask = get_subsequent_mask(latent)
                 dist_feat = self.sequence_model(latent, action, temporal_mask)
             else:
-                dist_feat = self.sequence_model(latent, action, inference_params)
+                action_for_model = self.preprocess_action_for_mamba(action)
+                dist_feat = self.sequence_model(latent, action_for_model, inference_params)
             last_dist_feat = dist_feat[:, -1:]
             prior_logits = self.dist_head.forward_prior(last_dist_feat)
             prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
@@ -444,7 +456,20 @@ class WorldModel(nn.Module):
             sample = dist.probs
         return sample
     
-    
+    def preprocess_action_for_mamba(self, action):
+        # For continuous actions, encode them in a way that will work with the one-hot operation
+        if self.continuous:
+            # Create a dummy action tensor with integer indices
+            batch_size, seq_len = action.shape[0], action.shape[1]
+            dummy_action = torch.zeros((batch_size, seq_len), dtype=torch.long, device=action.device)
+            
+            # After one-hot encoding, this will become [batch, seq, action_dim]
+            # where action_dim is the dimension expected by the model
+            return dummy_action
+        else:
+            # For discrete actions, return as is
+            return action
+
     def flatten_sample(self, sample):
         return rearrange(sample, "B L K C -> B L (K C)")
 
@@ -571,10 +596,10 @@ class WorldModel(nn.Module):
             action_list, old_logits_list = [], []
             i = 0
             while not should_stop(sample_list[-1], inference_params):
-                action, logits = agent.sample(torch.cat([self.sample_buffer[:, i:i+1], self.dist_feat_buffer[:, i:i+1]], dim=-1))
+                action, logits_or_logprob = agent.sample(torch.cat([self.sample_buffer[:, i:i+1], self.dist_feat_buffer[:, i:i+1]], dim=-1))
                 action_list.append(action)
                 self.action_buffer[:, i:i+1] = action
-                old_logits_list.append(logits)
+                old_logits_list.append(logits_or_logprob)
                 dist_feat = get_hidden_state(sample_list[-1], action_list[-1], inference_params)
                 dist_feat_list.append(dist_feat)
                 self.dist_feat_buffer[:, i+1:i+2] = dist_feat

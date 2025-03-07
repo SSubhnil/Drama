@@ -110,6 +110,8 @@ class ActorCriticAgent(nn.Module):
         self.action_dim = action_dim
         self.unimix_ratio = conf.Models.Agent.Unimix_ratio
         self.device = device
+        self.continuous = getattr(conf.BasicSettings, "ContinuousActions", False)
+        self.action_std_init = getattr(conf.Models.Agent.AC, "ActionStdInit", 0.6)
 
         self.symlog_twohot_loss = SymLogTwoHotLoss(255, -20, 20)
         act = getattr(nn, conf.Models.Agent.AC.Act)
@@ -126,10 +128,27 @@ class ActorCriticAgent(nn.Module):
                 RMSNorm(actor_hidden_dim),
                 act()
             ])
-        self.actor = nn.Sequential(
-            *actor,
-            layer_init(nn.Linear(actor_hidden_dim, action_dim), std=0.001)
-        ).to(device)
+        
+        if self.continuous:
+            # For continuous actions, we need mean and log_std outputs
+            self.actor_mean = nn.Sequential(
+                *actor,
+                layer_init(nn.Linear(actor_hidden_dim, action_dim), std=0.01)
+            ).to(device)
+            
+            # Initialize log_std
+            self.action_log_std = nn.Parameter(torch.ones(action_dim) * np.log(self.action_std_init), requires_grad=True)
+            
+            # No need for the discrete actor in this case
+            self.actor = None
+        else:
+            # For discrete actions (original implementation)
+            self.actor = nn.Sequential(
+                *actor,
+                layer_init(nn.Linear(actor_hidden_dim, action_dim), std=0.001)
+            ).to(device)
+            self.actor_mean = None
+            self.action_log_std = None
         
 
         critic = [
@@ -174,9 +193,14 @@ class ActorCriticAgent(nn.Module):
             slow_param.data.copy_(slow_param.data * decay + param.data * (1 - decay))
 
     def policy(self, x):
-        logits = self.actor(x)
-        logits = self.unimix(logits)
-        return logits
+        if self.continuous:
+            action_mean = self.actor_mean(x)
+            action_log_std = self.action_log_std.expand_as(action_mean)
+            return action_mean, action_log_std
+        else:
+            logits = self.actor(x)
+            logits = self.unimix(logits)
+            return logits
 
     def value(self, x):
         value = self.critic(x)
@@ -190,12 +214,18 @@ class ActorCriticAgent(nn.Module):
         return value
 
     def get_logits_raw_value(self, x):
-        logits = self.actor(x)
-        raw_value = self.critic(x)
-        return logits, raw_value
+        if self.continuous:
+            action_mean = self.actor_mean(x)
+            action_log_std = self.action_log_std.expand_as(action_mean)
+            raw_value = self.critic(x)
+            return action_mean, action_log_std, raw_value
+        else:
+            logits = self.actor(x)
+            raw_value = self.critic(x)
+            return logits, raw_value
 
     def unimix(self, logits):
-        # uniform noise mixing
+        # uniform noise mixing (only for discrete actions)
         if self.unimix_ratio > 0:
             probs = F.softmax(logits, dim=-1)
             uniform = torch.ones_like(probs) / self.action_dim
@@ -207,17 +237,41 @@ class ActorCriticAgent(nn.Module):
     def sample(self, latent, greedy=False):
         self.eval()
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
-            logits = self.policy(latent)
-            dist = distributions.Categorical(logits=logits)
-            if greedy:
-                action = dist.probs.argmax(dim=-1)
+            if self.continuous:
+                action_mean, action_log_std = self.policy(latent)
+                action_std = torch.exp(action_log_std)
+                
+                dist = distributions.Normal(action_mean, action_std)
+                
+                if greedy:
+                    action = action_mean
+                else:
+                    action = dist.sample()
+                
+                # Clip action to be within valid range [-1, 1]
+                action = torch.clamp(action, -1.0, 1.0)
+                
+                # For continuous actions, return the log_prob directly for PPO
+                log_prob = dist.log_prob(action).sum(dim=-1)
+                
+                return action, log_prob
             else:
-                action = dist.sample()
-        return action, logits
+                logits = self.policy(latent)
+                dist = distributions.Categorical(logits=logits)
+                if greedy:
+                    action = dist.probs.argmax(dim=-1)
+                else:
+                    action = dist.sample()
+                return action, logits
 
     def sample_as_env_action(self, latent, greedy=False):
         action, _ = self.sample(latent, greedy)
-        return action.detach().cpu().squeeze(-1).numpy()
+        if self.continuous:
+            # For continuous actions, return the raw action values scaled to the environment's action space
+            return action.detach().cpu().float().squeeze(1).numpy()
+        else:
+            # For discrete actions, return the action index
+            return action.detach().cpu().squeeze(-1).numpy()
     @profile
     def update(self, latent, action, old_logits, context_latent, context_reward, context_termination, reward, termination, logger, global_step):
         '''
@@ -225,29 +279,61 @@ class ActorCriticAgent(nn.Module):
         '''
         self.train()
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
-            logits, raw_value = self.get_logits_raw_value(latent)
-            dist = distributions.Categorical(logits=logits[:, :-1])
-            log_prob = dist.log_prob(action)
-            entropy = dist.entropy()
-
-            # decode value, calc lambda return
-            slow_value = self.slow_value(latent)
-            slow_lambda_return = calc_lambda_return(reward, slow_value, termination, self.gamma, self.lambd)
-            value = self.symlog_twohot_loss.decode(raw_value)
-            lambda_return = calc_lambda_return(reward, value, termination, self.gamma, self.lambd)
-
-            # update value function with slow critic regularization
-            value_loss = self.symlog_twohot_loss(raw_value[:, :-1], lambda_return.detach())
-            slow_value_regularization_loss = self.symlog_twohot_loss(raw_value[:, :-1], slow_lambda_return.detach())
+            if self.continuous:
+                # For continuous actions
+                action_mean, action_log_std, raw_value = self.get_logits_raw_value(latent)
+                action_std = torch.exp(action_log_std)
+                dist = distributions.Normal(action_mean[:, :-1], action_std[:, :-1])
                 
-            lower_bound = self.lowerbound_ema(percentile(lambda_return, 0.05))
-            upper_bound = self.upperbound_ema(percentile(lambda_return, 0.95))
-            S = upper_bound-lower_bound
-            norm_ratio = torch.max(torch.ones(1, device=reward.device), S)  # max(1, S) in the paper
-            norm_advantage = (lambda_return-value[:, :-1]) / norm_ratio
-            policy_loss = -(log_prob * norm_advantage.detach()).mean()
+                # Get log probabilities
+                log_prob = dist.log_prob(action).sum(dim=-1)  # Sum over action dimensions
+                
+                # Calculate entropy for continuous actions
+                entropy = dist.entropy().sum(dim=-1)  # Sum over action dimensions
+                
+                # Similar value processing as for discrete actions
+                slow_value = self.slow_value(latent)
+                slow_lambda_return = calc_lambda_return(reward, slow_value, termination, self.gamma, self.lambd)
+                value = self.symlog_twohot_loss.decode(raw_value)
+                lambda_return = calc_lambda_return(reward, value, termination, self.gamma, self.lambd)
+                
+                # Update value function
+                value_loss = self.symlog_twohot_loss(raw_value[:, :-1], lambda_return.detach())
+                slow_value_regularization_loss = self.symlog_twohot_loss(raw_value[:, :-1], slow_lambda_return.detach())
+                
+                lower_bound = self.lowerbound_ema(percentile(lambda_return, 0.05))
+                upper_bound = self.upperbound_ema(percentile(lambda_return, 0.95))
+                S = upper_bound-lower_bound
+                norm_ratio = torch.max(torch.ones(1, device=reward.device), S)  # max(1, S) in the paper
+                norm_advantage = (lambda_return-value[:, :-1]) / norm_ratio
+                policy_loss = -(log_prob * norm_advantage.detach()).mean()
+                
+                entropy_loss = entropy.mean()
+            else:
+                # Original discrete action implementation
+                logits, raw_value = self.get_logits_raw_value(latent)
+                dist = distributions.Categorical(logits=logits[:, :-1])
+                log_prob = dist.log_prob(action)
+                entropy = dist.entropy()
 
-            entropy_loss = entropy.mean()
+                # decode value, calc lambda return
+                slow_value = self.slow_value(latent)
+                slow_lambda_return = calc_lambda_return(reward, slow_value, termination, self.gamma, self.lambd)
+                value = self.symlog_twohot_loss.decode(raw_value)
+                lambda_return = calc_lambda_return(reward, value, termination, self.gamma, self.lambd)
+
+                # update value function with slow critic regularization
+                value_loss = self.symlog_twohot_loss(raw_value[:, :-1], lambda_return.detach())
+                slow_value_regularization_loss = self.symlog_twohot_loss(raw_value[:, :-1], slow_lambda_return.detach())
+                    
+                lower_bound = self.lowerbound_ema(percentile(lambda_return, 0.05))
+                upper_bound = self.upperbound_ema(percentile(lambda_return, 0.95))
+                S = upper_bound-lower_bound
+                norm_ratio = torch.max(torch.ones(1, device=reward.device), S)  # max(1, S) in the paper
+                norm_advantage = (lambda_return-value[:, :-1]) / norm_ratio
+                policy_loss = -(log_prob * norm_advantage.detach()).mean()
+
+                entropy_loss = entropy.mean()
 
             loss = policy_loss + value_loss + slow_value_regularization_loss - self.entropy_coef * entropy_loss
 
@@ -296,6 +382,8 @@ class PPOAgent(nn.Module):
         self.action_dim = action_dim
         self.unimix_ratio = conf.Models.Agent.Unimix_ratio
         self.device = device
+        self.continuous = getattr(conf.BasicSettings, "ContinuousActions", False)
+        self.action_std_init = getattr(conf.Models.Agent.PPO, "ActionStdInit", 0.6)
 
         self.symlog_twohot_loss = SymLogTwoHotLoss(255, -20, 20)
         act = getattr(nn, conf.Models.Agent.PPO.Act)
@@ -312,10 +400,27 @@ class PPOAgent(nn.Module):
                 RMSNorm(actor_hidden_dim),
                 act()
             ])
-        self.actor = nn.Sequential(
-            *actor,
-            layer_init(nn.Linear(actor_hidden_dim, action_dim), std=0.001)
-        ).to(device)
+        
+        if self.continuous:
+            # For continuous actions, we need mean and log_std outputs
+            self.actor_mean = nn.Sequential(
+                *actor,
+                layer_init(nn.Linear(actor_hidden_dim, action_dim), std=0.01)
+            ).to(device)
+            
+            # Initialize log_std
+            self.action_log_std = nn.Parameter(torch.ones(action_dim) * np.log(self.action_std_init), requires_grad=True)
+            
+            # No need for the discrete actor in this case
+            self.actor = None
+        else:
+            # For discrete actions (original implementation)
+            self.actor = nn.Sequential(
+                *actor,
+                layer_init(nn.Linear(actor_hidden_dim, action_dim), std=0.001)
+            ).to(device)
+            self.actor_mean = None
+            self.action_log_std = None
 
         critic = [
             layer_init(nn.Linear(feat_dim, critic_hidden_dim, bias=True)),
@@ -354,21 +459,36 @@ class PPOAgent(nn.Module):
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
     @profile
     def get_logp_val_entr(self, latent, action, longer_value=True):
-        if longer_value:
-            logits = self.actor(latent[:, :-1])
+        if self.continuous:
+            if longer_value:
+                action_mean = self.actor_mean(latent[:, :-1])
+                action_log_std = self.action_log_std.expand_as(action_mean)
+            else:
+                action_mean = self.actor_mean(latent)
+                action_log_std = self.action_log_std.expand_as(action_mean)
+                
+            value = self.critic(latent)
+            
+            action_std = torch.exp(action_log_std)
+            dist = distributions.Normal(action_mean, action_std)
+            logp_prob = dist.log_prob(action).sum(dim=-1)  # Sum over action dimensions
+            entropy = dist.entropy().sum(dim=-1)  # Sum over action dimensions
         else:
-            logits = self.actor(latent)
-        value = self.critic(latent)
-        dist = distributions.Categorical(logits=logits)
-        logp_prob = dist.log_prob(action)
-        entropy = dist.entropy()
+            if longer_value:
+                logits = self.actor(latent[:, :-1])
+            else:
+                logits = self.actor(latent)
+            value = self.critic(latent)
+            dist = distributions.Categorical(logits=logits)
+            logp_prob = dist.log_prob(action)
+            entropy = dist.entropy()
 
         return logp_prob, value, entropy
     
     
     def unimix(self, logits):
-        # uniform noise mixing
-        if self.unimix_ratio > 0:
+        # uniform noise mixing - only applies to discrete actions
+        if not self.continuous and self.unimix_ratio > 0:
             probs = F.softmax(logits, dim=-1)
             uniform = torch.ones_like(probs) / self.action_dim
             mixed_probs = self.unimix_ratio * uniform + (1-self.unimix_ratio) * probs
@@ -376,30 +496,58 @@ class PPOAgent(nn.Module):
         return logits
 
     def sample_as_env_action(self, latent, greedy=False):
-            action, _ = self.sample(latent, greedy)
-            return action.detach().cpu().squeeze(-1).numpy()    
+        action, _ = self.sample(latent, greedy)
+        if self.continuous:
+            # For continuous actions, return the raw action values scaled to the environment's action space
+            return action.detach().cpu().numpy()
+        else:
+            # For discrete actions, return the action index
+            return action.detach().cpu().squeeze(-1).numpy()
+    
     @profile
     def comput_loss(self, latent, action, logp_old, advs, rtgs, slow_return):
+        if self.continuous:
+            # For continuous actions
+            action_mean = self.actor_mean(latent)
+            action_log_std = self.action_log_std.expand_as(action_mean)
+            action_std = torch.exp(action_log_std)
+            
+            dist = distributions.Normal(action_mean, action_std)
+            logp = dist.log_prob(action).sum(dim=-1)
+            
+            # Compute ratio and KL approximation
+            ratio = torch.exp(logp - logp_old)
+            kl_apx = ((ratio - 1) - (logp - logp_old)).mean()
+            
+            # Compute clipped advantage
+            clip_advs = torch.clamp(ratio, 1-self.eps_clip, 1+self.eps_clip) * advs
+            actor_loss = -(torch.min(ratio*advs.detach(), clip_advs.detach())).mean()
+            
+            # Compute critic loss and entropy
+            raw_values = self.critic(latent)
+            slow_critic_loss = self.symlog_twohot_loss(raw_values, slow_return.detach())
+            critic_loss = self.symlog_twohot_loss(raw_values, rtgs.detach())
+            
+            entropy = dist.entropy().sum(dim=-1).mean()  # Sum over action dimensions for each sample, then mean
+        else:
+            # Original discrete action implementation
+            logp, raw_values, entropy = self.get_logp_val_entr(latent, action, longer_value=False)
 
-        logp, raw_values, entropy = self.get_logp_val_entr(latent, action, longer_value=False)
+            ratio = torch.exp(logp - logp_old)
+            # Kl approx according to http://joschu.net/blog/kl-approx.html
+            kl_apx = ((ratio - 1) - (logp - logp_old)).mean()
+        
+            clip_advs = torch.clamp(ratio, 1-self.eps_clip, 1+self.eps_clip) * advs
+            # Torch Adam implement tation mius the gradient, to plus the gradient, we need make the loss negative
+            actor_loss = -(torch.min(ratio*advs.detach(), clip_advs.detach())).mean()
 
-        ratio = torch.exp(logp - logp_old)
-        # Kl approx according to http://joschu.net/blog/kl-approx.html
-        kl_apx = ((ratio - 1) - (logp - logp_old)).mean()
-    
-        clip_advs = torch.clamp(ratio, 1-self.eps_clip, 1+self.eps_clip) * advs
-        # Torch Adam implement tation mius the gradient, to plus the gradient, we need make the loss negative
-        actor_loss = -(torch.min(ratio*advs.detach(), clip_advs.detach())).mean()
+            slow_critic_loss = self.symlog_twohot_loss(raw_values, slow_return.detach())
+            critic_loss = self.symlog_twohot_loss(raw_values, rtgs.detach())
+            
+            entropy_loss = entropy.mean()
+            entropy = entropy_loss  # Just for consistency with the continuous case
 
-        # values = values.flatten() # I used squeeze before, maybe a mistake
-        slow_critic_loss = self.symlog_twohot_loss(raw_values, slow_return.detach())
-        critic_loss = self.symlog_twohot_loss(raw_values, rtgs.detach())
-        # critic_loss = F.mse_loss(values, rtgs)
-        # critic_loss = ((values - rtgs) ** 2).mean()
-
-        entropy_loss = entropy.mean()
-
-        return actor_loss, critic_loss, slow_critic_loss, entropy_loss, kl_apx 
+        return actor_loss, critic_loss, slow_critic_loss, entropy, kl_apx 
 
 
     @profile
@@ -455,8 +603,14 @@ class PPOAgent(nn.Module):
         self.train()
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
             feat_dim = latent.shape[-1]
-            dist = distributions.Categorical(logits=old_logits)
-            old_logp = dist.log_prob(action)
+            
+            if self.continuous:
+                # For continuous actions, old_logits contains log_probs directly
+                old_logp = old_logits
+            else:
+                # For discrete actions, need to get log_probs from categorical distribution
+                dist = distributions.Categorical(logits=old_logits)
+                old_logp = dist.log_prob(action)
 
             flatten_latent = latent[:, :-1].reshape(-1, feat_dim)
             flatten_action = action.view(-1)
@@ -477,19 +631,13 @@ class PPOAgent(nn.Module):
 
                 lambda_return = calc_lambda_return(reward, value, termination, self.gamma, self.lambd)
                 slow_lambda_return = calc_lambda_return(reward, slow_value, termination, self.gamma, self.lambd)
-                # context_lambda_return = calc_lambda_return(context_reward[:, 1:], context_termination[:, 1:], self.gamma, self.lamb)
                 
-                # advantage, lambda_return = self.calc_gae_and_reward_to_go(reward, value, termination)
-                # Normalize the tensor
-                # norm_advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
-
                 lower_bound = self.lowerbound_ema(percentile(lambda_return, 0.05))
                 upper_bound = self.upperbound_ema(percentile(lambda_return, 0.95))
                 S = upper_bound-lower_bound
                 norm_ratio = torch.max(torch.ones(1, device=reward.device), S)  # max(1, S) in the paper
                 norm_advantage = (lambda_return-value[:, :-1]) / norm_ratio
                 
-
                 flatten_advantages = norm_advantage.view(-1)
                 flatten_returns = lambda_return.reshape(-1)
                 flatten_slow_return = slow_lambda_return.reshape(-1)                
@@ -543,12 +691,32 @@ class PPOAgent(nn.Module):
     def sample(self, latent, greedy=False):
         self.eval()
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
-            logits = self.actor(latent)
-            logits = self.unimix(logits)
-            dist = distributions.Categorical(logits=logits)
-            if greedy:
-                action = dist.probs.argmax(dim=-1)
+            if self.continuous:
+                action_mean = self.actor_mean(latent)
+                action_log_std = self.action_log_std.expand_as(action_mean)
+                action_std = torch.exp(action_log_std)
+                
+                dist = distributions.Normal(action_mean, action_std)
+                
+                if greedy:
+                    action = action_mean
+                else:
+                    action = dist.sample()
+                
+                # Clip action to be within valid range [-1, 1]
+                action = torch.clamp(action, -1.0, 1.0)
+                
+                # For continuous actions, log_prob needs to be computed separately
+                log_prob = dist.log_prob(action).sum(dim=-1)
+                
+                return action, log_prob
             else:
-                action = dist.sample()
-        return action, logits
+                logits = self.actor(latent)
+                logits = self.unimix(logits)
+                dist = distributions.Categorical(logits=logits)
+                if greedy:
+                    action = dist.probs.argmax(dim=-1)
+                else:
+                    action = dist.sample()
+                return action, logits
 
